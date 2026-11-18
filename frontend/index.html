@@ -52,9 +52,9 @@ createApp({
     const token=ref(localStorage.getItem('contractlab_token')||'');
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
-    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
+    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({}), events=ref([]), policy=ref({});
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
-    const nav=['契约版本','入站校验','双写缓冲','契约对账'];
+    const nav=['契约版本','入站校验','双写缓冲','契约对账','治理策略'];
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -81,7 +81,25 @@ createApp({
       buffers.value=Array.isArray(u.items)?u.items:[];
       const q=await loadJson('/api/reconcile'); if(q===null) return;
       recon.value=q&&typeof q==='object'?q:{};
+      const e=await loadJson('/api/governance/events'); if(e===null) return;
+      events.value=Array.isArray(e.items)?e.items:[];
+      const p=await loadJson('/api/governance/policy'); if(p===null) return;
+      policy.value=p&&typeof p==='object'?p:{};
     }
+    async function govPost(url,body){
+      const r=await fetch(url,{method:'POST',headers:auth(),body:JSON.stringify(body||{})});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok){actionErr.value=j.detail||'治理操作失败';}
+      await refresh();
+      return r;
+    }
+    async function backfill(b){
+      const payload_fields=window.prompt('补齐后的载荷字段（逗号分隔）', b.payload_fields||'');
+      if(payload_fields===null) return;
+      await govPost('/api/governance/backfill',{batch_id:b.batch_id,payload_fields});
+    }
+    async function cleanup(b){ await govPost('/api/governance/cleanup',{batch_id:b.batch_id}); }
+    async function sweep(){ await govPost('/api/governance/sweep'); }
     async function validate(){
       actionErr.value='';
       const r=await fetch('/api/ingress/validate',{method:'POST',headers:auth(),body:JSON.stringify(form.value)});
@@ -89,7 +107,7 @@ createApp({
       await refresh();
     }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,events,policy,form,actionErr,login,logout,validate,backfill,cleanup,sweep};
   },
   template:`
   <div v-if="!token" class="login">
@@ -133,13 +151,34 @@ createApp({
       </div>
     </div>
     <div class="card" v-show="tab===2">
-      <h2>双写缓冲</h2>
-      <table><thead><tr><th>缓冲</th><th>批次</th><th>主题</th><th>原因</th></tr></thead>
-      <tbody><tr v-for="b in buffers" :key="b.id"><td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason}}</td></tr></tbody></table>
+      <h2>双写缓冲 <span class="meta">队列仅含绑定真实批次的缓冲行，无空批号</span></h2>
+      <table><thead><tr><th>缓冲</th><th>批次</th><th>主题</th><th>原因</th><th>治理</th></tr></thead>
+      <tbody><tr v-for="b in buffers" :key="b.id">
+        <td>{{b.id}}</td><td>#{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason}}</td>
+        <td style="white-space:nowrap">
+          <button class="ghost" @click="backfill(b)">补齐</button>
+          <button class="ghost" @click="cleanup(b)">清理</button>
+        </td>
+      </tr>
+      <tr v-if="!buffers.length"><td colspan="5" class="meta">暂无缓冲行</td></tr></tbody></table>
     </div>
     <div class="card" v-show="tab===3">
       <h2>契约对账摘要</h2>
-      <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 孤儿行 {{recon.orphan_rows}} · 对齐 {{recon.aligned}}</p>
+      <p class="meta" v-if="recon.orphan_rows">检测到 {{recon.orphan_rows}} 行无批次孤儿缓冲，不计入对账；可在治理策略附页清扫留痕。</p>
+    </div>
+    <div class="card" v-show="tab===4">
+      <h2>治理策略附页</h2>
+      <p class="meta">口径锁定日期：{{policy.locked_date}} ｜ 文档：{{policy.doc}}</p>
+      <p>选定路径：<b>{{policy.path}}路径</b>（隔离表启用：{{policy.isolation_table_enabled}}）—— {{policy.rule}}</p>
+      <p class="meta">缓冲行必须绑定真实批次：同事务双写 + 外键约束；无批次缓冲不计入对账；清理禁止误删正式通过；补齐与清理抢写排队，后到只记争用。</p>
+      <button class="primary" @click="sweep">清扫孤儿缓冲</button>
+      <h2 style="margin-top:18px">治理留痕</h2>
+      <table><thead><tr><th>#</th><th>事件</th><th>说明</th><th>值班</th><th>时间</th></tr></thead>
+      <tbody><tr v-for="g in events" :key="g.id">
+        <td>{{g.id}}</td><td>{{g.event}}</td><td>{{g.detail}}</td><td>{{g.actor}}</td><td>{{g.created_at}}</td>
+      </tr>
+      <tr v-if="!events.length"><td colspan="5" class="meta">暂无治理事件</td></tr></tbody></table>
     </div>
   </div>`
 }).mount('#app');
